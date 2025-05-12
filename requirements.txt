@@ -1,0 +1,4 @@
+python-mirai-core
+asyncio
+aiohttp
+requests
