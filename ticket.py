@@ -66,6 +66,7 @@ async def ticket_polling(bot):
         # 9秒发送一次封装信息
         # 对应3次请求
         if available and time.time() - last >= 9:
+            # 此处消息头写死用来节约时间，实际更改即可
             msg = f"CPP\n杭州·COMICUP 31\n" + "\n".join(available) + f"\n{datetime.now():%Y.%m.%d %H:%M:%S}"
             await safe_send(bot, msg)
             last = time.time()
@@ -136,6 +137,7 @@ async def bili_polling(bot: Bot):
             now = time.time()
             # 5秒发送一次封装信息
             if now - last_send >= 5:
+                # 此处消息头写死用来节约时间，实际更改即可
                 full = [f"会员购\nCOMICUP31同人展"] + msgs + [datetime.now().strftime("%Y.%m.%d %H:%M:%S")]
                 text = "\n".join(full)
                 if text != prev_msg:
@@ -173,7 +175,9 @@ async def main():
     await asyncio.gather(
         updater.run_task(),
         # 如需禁用某一部分爬取直接注释掉即可
+        # CPP部分
         ticket_polling(bot),
+        # B站部分
         bili_polling(bot),
     )
 
