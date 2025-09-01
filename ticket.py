@@ -24,7 +24,8 @@ PORT = 1111
 AUTH_KEY = 'verifyKey'
 # 替换为您的群号
 GROUP_ID = 111111
-
+# 固定常量，在有票的情况下
+SEND_INTERVAL = 3.0
 # CPP API部分
 # 修改event_id即可更换活动
 EVENT_ID = 4670
@@ -59,44 +60,55 @@ async def get_ticket_info_api(event_id):
 
 async def ticket_polling(bot):
     """
-    监控 CPP 票务：当某票种 remainderNum 发生变化即推送；
-    remainderNum == 0 时输出“已售罄”。
-    仍保持 3 秒一次请求，避免和下单接口共享风控。
+    监控 CPP 票务：
+    - 余量(remainderNum)变化 => 推送
+    - 只要当前“有票”(任一票种 remainderNum > 0) => 每 SEND_INTERVAL 秒重复推送一次快照
+    - 余量为 0 时显示“已售罄”，有票时显示“可购买(n)”
+    - 显示格式：{square}{ticketName} {status}
     """
     last_send = 0.0
     first_run = True
-    prev_map: dict[str, int] = {}  # key: 票种名(或ID) -> 上次余量
+    prev_map: dict[str, int] = {}  # 票项唯一键 -> 上次余量
 
     while True:
         data = await get_ticket_info_api(EVENT_ID)
         curr_map: dict[str, int] = {}
-        changes: list[str] = []
+        change_lines: list[str] = []
+        available_lines: list[str] = []
 
         for t in data.get("ticketTypeList", []):
-            # 统一构造稳定主键，优先使用 id；退化到 ticketTypeId 或 组合键
-            key = str(t.get("id"))
-            rem = int(t.get("remainderNum", 0) or 0)
+            key = str(t.get("id") or t.get("ticketTypeId") or f"{t.get('ticketName','')}|{t.get('square','')}")
+            square = (t.get("square") or "").strip()
+            name   = (t.get("ticketName") or "").strip()
+            rem    = int(t.get("remainderNum", 0) or 0)
 
             curr_map[key] = rem
+            status = f"可购买({rem})" if rem > 0 else "已售罄"
+            line   = f"{square} {name} {status}"
 
+            # 变化触发
             if first_run or prev_map.get(key) != rem:
-                square = (t.get("square") or "").strip()
-                ticket_name = (t.get("ticketName") or "").strip()
-                title = f"{square}{ticket_name}".strip()
+                change_lines.append(line)
 
-                status = f"预售中({rem})" if rem > 0 else "已售罄"
-                changes.append(f"{title} {status}")
+            # “有票”快照
+            if rem > 0:
+                available_lines.append(line)
 
+        has_ticket = len(available_lines) > 0
         now = time.time()
-        if changes and (now - last_send >= 3.0):
-            body = [f"CPP项目{EVENT_ID}状态更新："] + changes + [datetime.now().strftime("%Y.%m.%d %H:%M:%S")]
-            text = "\n".join(body)
-            await safe_send(bot, [Message.Plain(text)])
+
+        # 发送条件：有变更 或 有票；同时满足节流
+        if (change_lines or has_ticket) and (now - last_send >= SEND_INTERVAL):
+            # 合并：先变更，再当前有票快照（去重保持顺序）
+            merged = list(dict.fromkeys(change_lines + available_lines))
+            body = ["CPP状态更新："] + merged + [datetime.now().strftime("%Y.%m.%d %H:%M:%S")]
+            await safe_send(bot, [Message.Plain("\n".join(body))])
+
             last_send = now
             first_run = False
-            prev_map = curr_map
+            prev_map  = curr_map  # 同步最新余量快照
 
-        # CPP 风控：与下单接口共享，保守 3 秒一轮
+        # 风控：3 秒一轮
         await asyncio.sleep(0.6)
 
 # B站API部分
@@ -157,6 +169,12 @@ def format_bili_messages(data: dict) -> list[str]:
                 lines.append(f"{date} {desc} {status}({cnt})")
     return lines
 
+def _is_on_sale(flag) -> bool:
+    try:
+        return int(flag) == 2
+    except Exception:
+        return False
+
 async def bili_polling(bot: Bot):
     last_send = 0.0
     first_run = True
@@ -171,29 +189,40 @@ async def bili_polling(bot: Bot):
             data = info.get("data", {}) or {}
 
             curr_status: dict[str, str] = {}
-            changes: list[str] = []
+            change_lines: list[str] = []
+            available_lines: list[str] = []
 
             for screen in data.get("screen_list", []):
                 date = screen.get("name", "")
                 for ticket in screen.get("ticket_list", []):
                     desc    = ticket.get("desc", "")
-                    display = ticket.get("sale_flag", {}).get("display_name", "")
+                    flag    = (ticket.get("sale_flag") or {}).get("number")
+                    display = (ticket.get("sale_flag") or {}).get("display_name", "")
                     key     = f"{date}||{desc}"
+
                     curr_status[key] = display
 
+                    # 变化触发
                     if first_run or prev_status[pid].get(key) != display:
-                        changes.append(f"{date} {desc} {display}")
+                        change_lines.append(f"{date} {desc} {display}")
 
+                    # “有票”快照（根据 sale_flag.number 判定）
+                    if _is_on_sale(flag):
+                        available_lines.append(f"{date} {desc} {display}")
+
+            has_ticket = len(available_lines) > 0
             now = time.time()
-            if changes and (now - last_send >= 3.0):
-                body = [f"B站项目{pid}状态更新："] + changes + [datetime.now().strftime("%Y.%m.%d %H:%M:%S")]
-                text = "\n".join(body)
-                await safe_send(bot, [Message.Plain(text)])
+
+            if (change_lines or has_ticket) and (now - last_send >= SEND_INTERVAL):
+                merged = list(dict.fromkeys(change_lines + available_lines))
+                body = [f"B站项目{pid}状态更新："] + merged + [datetime.now().strftime("%Y.%m.%d %H:%M:%S")]
+                await safe_send(bot, [Message.Plain("\n".join(body))])
+
                 last_send = now
                 first_run = False
                 prev_status[pid] = curr_status.copy()
 
-            # 每监控完一个项目休眠，降低抓取频率
+            # 项目间休眠，降低抓取频率与抖动
             await asyncio.sleep(0.6)
 
 async def safe_send(bot: Bot, chain):
