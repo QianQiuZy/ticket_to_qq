@@ -193,22 +193,35 @@ async def bili_polling(bot: Bot):
             available_lines: list[str] = []
 
             for screen in data.get("screen_list", []):
-                date = screen.get("name", "")
                 for ticket in screen.get("ticket_list", []):
-                    desc    = ticket.get("desc", "")
-                    flag    = (ticket.get("sale_flag") or {}).get("number")
-                    display = (ticket.get("sale_flag") or {}).get("display_name", "")
-                    key     = f"{date}||{desc}"
+                    # 日期优先取票项上的 screen_name，回退到 screen.name
+                    date = (ticket.get("screen_name") or screen.get("name") or "").strip()
+                    desc = (ticket.get("desc") or "").strip()
 
+                    sale_flag = (ticket.get("sale_flag") or {})
+                    flag = sale_flag.get("number") or ticket.get("sale_flag_number")
+                    display = sale_flag.get("display_name", "") or ""
+
+                    # 任何状态都附带数量；无效/缺失则按 0 处理
+                    count = ticket.get("num", 0)
+                    try:
+                        count = int(count)
+                    except Exception:
+                        count = 0
+                    if count < 0:
+                        count = 0
+
+                    display_fmt = f"{display}({count})"
+                    key = f"{date}||{desc}"
+
+                    # 变更判定仍只跟踪 display（不把数量纳入变更）
                     curr_status[key] = display
-
-                    # 变化触发
                     if first_run or prev_status[pid].get(key) != display:
-                        change_lines.append(f"{date} {desc} {display}")
+                        change_lines.append(f"{date} {desc} {display_fmt}")
 
-                    # “有票”快照（根据 sale_flag.number 判定）
+                    # 有票时进入“定频推送”快照
                     if _is_on_sale(flag):
-                        available_lines.append(f"{date} {desc} {display}")
+                        available_lines.append(f"{date} {desc} {display_fmt}")
 
             has_ticket = len(available_lines) > 0
             now = time.time()
