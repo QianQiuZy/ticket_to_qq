@@ -678,9 +678,8 @@ async def bili_full_snapshot_lines(group_id: Optional[int] = None) -> list[str]:
     project_ids = [pid for pid in sorted(CONFIG_BILI_PROJECT_IDS) if group_id is None or group_id in _get_push_groups(pid)]
     single_project = len(project_ids) == 1
     for project_id in project_ids:
-        chg, avail, curr = await bili_fetch_once_for(project_id)
-        _bili_prev_status[project_id] = curr
-        project_lines = list(dict.fromkeys(chg + avail))
+        info = await bili_fetch_raw(project_id)
+        project_lines = bili_status_lines_from_info(info)
         lines.extend(project_lines if single_project else [f"[{project_id}] {line}" for line in project_lines])
     return lines
 
