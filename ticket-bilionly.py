@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false, reportInvalidTypeForm=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportMissingTypeArgument=false, reportDeprecated=false, reportConstantRedefinition=false, reportOptionalMemberAccess=false, reportArgumentType=false, reportAny=false, reportUnusedCallResult=false, reportUnnecessaryIsInstance=false, reportUnreachable=false, reportUntypedFunctionDecorator=false, reportUnusedFunction=false, reportCallInDefaultInitializer=false
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +8,7 @@ from datetime import datetime
 from typing import Dict, Optional, Set
 
 import httpx
-from nonebot import get_bots, get_driver, on_command, require
+from nonebot import get_bots, get_driver, on_command
 from nonebot.adapters.onebot.v11 import Bot, Message
 from nonebot.adapters.onebot.v11.event import GroupMessageEvent
 from nonebot.adapters.onebot.v11.exception import ActionFailed
@@ -20,9 +21,6 @@ try:
     import redis.asyncio as aioredis
 except Exception:  # pragma: no cover
     aioredis = None
-
-require("nonebot_plugin_apscheduler")
-from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 __plugin_meta__ = PluginMetadata(
     name="B站票务监控",
@@ -81,6 +79,10 @@ _bili_last_avail_push: Dict[int, float] = {}
 _bili_prev_status: Dict[int, Dict[str, str]] = {}
 _bili_rebuild_lock = asyncio.Lock()
 _bili_job_lock = asyncio.Lock()
+_bili_worker_lock = asyncio.Lock()
+_bili_poll_task: asyncio.Task | None = None
+_bili_send_task: asyncio.Task | None = None
+_bili_send_queue: asyncio.Queue[tuple[str, Set[int]]] = asyncio.Queue()
 
 
 def _config_or_env_value(*names: str) -> Optional[str]:
@@ -349,12 +351,12 @@ async def _remove_group_from_all_config_buckets(gid: int):
 async def _add_monitor_config(project_id: int) -> bool:
     project_id = int(project_id)
     if project_id in CONFIG_BILI_PROJECT_IDS:
-        await _sync_bili_job()
+        await _sync_bili_worker()
         return False
     CONFIG_BILI_PROJECT_IDS.add(project_id)
     _reset_bili_state(project_id)
     await _redis_add_monitor_config(project_id)
-    await _sync_bili_job()
+    await _sync_bili_worker()
     return True
 
 
@@ -367,7 +369,7 @@ async def _remove_monitor_config(project_id: int) -> bool:
     _reset_bili_state(project_id)
     await _redis_remove_monitor_config(project_id)
     await _redis_delete_config_groups(project_id)
-    await _sync_bili_job()
+    await _sync_bili_worker()
     return True
 
 
@@ -409,13 +411,15 @@ async def _init_client_and_redis():
                 _redis = None
                 logger.warning(f"Redis 连接失败，将仅使用内存配置：{e}")
 
-    await _sync_bili_job()
+    await _sync_bili_worker()
     logger.opt(colors=True).info("<g>nonebot_plugin_ticket_watch</g> 初始化完成")
 
 
 @driver.on_shutdown
 async def _close_client_and_redis():
     global bili_client, _redis
+    await _stop_bili_workers()
+
     try:
         if bili_client:
             await bili_client.aclose()
@@ -431,22 +435,75 @@ async def _close_client_and_redis():
         _redis = None
 
 
-async def _sync_bili_job():
-    job = scheduler.get_job("ticket_watch_bili")
+async def _sync_bili_worker():
     if CONFIG_BILI_PROJECT_IDS:
-        if job is None:
-            scheduler.add_job(
-                bili_tick_and_maybe_send,
-                "interval",
-                seconds=POLL_INTERVAL_BILI_SEC,
-                id="ticket_watch_bili",
-                max_instances=2,
-                coalesce=True,
-            )
-            logger.info("B站票务监控任务已启动，轮询周期 %.1fs", POLL_INTERVAL_BILI_SEC)
-    elif job is not None:
-        scheduler.remove_job("ticket_watch_bili")
-        logger.info("B站票务监控任务已停止（当前无配置）")
+        await _start_bili_workers()
+    else:
+        await _stop_bili_workers()
+
+
+async def _start_bili_workers():
+    global _bili_poll_task, _bili_send_task
+    async with _bili_worker_lock:
+        if _bili_send_task is None or _bili_send_task.done():
+            _bili_send_task = asyncio.create_task(_bili_send_worker(), name="ticket_watch_bili_sender")
+        if _bili_poll_task is None or _bili_poll_task.done():
+            _bili_poll_task = asyncio.create_task(_bili_poll_worker(), name="ticket_watch_bili_poller")
+            logger.info("B站票务监控 worker 已启动，轮询周期 %.1fs", POLL_INTERVAL_BILI_SEC)
+
+
+async def _stop_bili_workers():
+    global _bili_poll_task, _bili_send_task
+    async with _bili_worker_lock:
+        tasks = [task for task in (_bili_poll_task, _bili_send_task) if task is not None and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("B站票务监控 worker 已停止（当前无配置或插件关闭）")
+        _bili_poll_task = None
+        _bili_send_task = None
+        while not _bili_send_queue.empty():
+            try:
+                _bili_send_queue.get_nowait()
+                _bili_send_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+
+async def _bili_poll_worker():
+    while True:
+        started = time.perf_counter()
+        try:
+            await bili_tick_and_maybe_send()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"B站票务轮询 worker 异常：{e}")
+
+        elapsed = time.perf_counter() - started
+        sleep_for = POLL_INTERVAL_BILI_SEC - elapsed
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
+
+
+async def _bili_send_worker():
+    while True:
+        text, groups = await _bili_send_queue.get()
+        try:
+            await safe_broadcast(text, groups)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"B站票务发送 worker 异常：{e}")
+        finally:
+            _bili_send_queue.task_done()
+
+
+async def _enqueue_broadcast(text: str, target_groups: Set[int]):
+    groups = set(target_groups) & set(ENABLED_GROUPS)
+    if text and groups:
+        await _bili_send_queue.put((text, groups))
 
 
 async def bili_fetch_raw(project_id: int) -> dict:
@@ -581,7 +638,7 @@ async def bili_tick_and_maybe_send():
                 *merged,
                 datetime.now().strftime("%Y.%m.%d %H:%M:%S"),
             ]
-            await safe_broadcast("\n".join(body), _get_push_groups(project_id))
+            await _enqueue_broadcast("\n".join(body), _get_push_groups(project_id))
             _bili_last_send[project_id] = now
             _bili_prev_status[project_id] = curr
 

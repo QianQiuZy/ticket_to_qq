@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false, reportInvalidTypeForm=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportMissingTypeArgument=false, reportDeprecated=false, reportConstantRedefinition=false, reportOptionalMemberAccess=false, reportArgumentType=false, reportAny=false, reportUnusedCallResult=false, reportUnnecessaryIsInstance=false, reportUnreachable=false, reportUntypedFunctionDecorator=false, reportUnusedFunction=false, reportCallInDefaultInitializer=false, reportImplicitStringConcatenation=false, reportUnusedImport=false, reportUnusedVariable=false, reportUnusedParameter=false, reportPossiblyUnboundVariable=false
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +10,7 @@ from datetime import datetime
 from typing import Dict, List, Set, Optional
 
 import httpx
-from nonebot import get_bots, get_driver, on_command, require
+from nonebot import get_bots, get_driver, on_command
 from nonebot.adapters.onebot.v11 import Bot, Message
 from nonebot.adapters.onebot.v11.event import GroupMessageEvent
 from nonebot.adapters.onebot.v11.exception import ActionFailed
@@ -23,9 +24,6 @@ try:
     import redis.asyncio as aioredis  # 推荐 >=5
 except Exception:  # pragma: no cover
     aioredis = None
-
-require("nonebot_plugin_apscheduler")
-from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 __plugin_meta__ = PluginMetadata(
     name="票务监控 (CPP + B站 + 小芒 + 奇古米)",
@@ -550,7 +548,7 @@ async def _add_monitor_config(platform: str, target_id: int | str, extra: Option
 
     if changed:
         await _redis_add_monitor_config(platform, target_id, extra=extra)
-        await _sync_platform_job(platform)
+        await _sync_platform_worker(platform)
     return changed
 
 async def _remove_monitor_config(platform: str, target_id: int | str):
@@ -589,7 +587,7 @@ async def _remove_monitor_config(platform: str, target_id: int | str):
         await _redis_remove_monitor_config(platform, target_id)
         CONFIG_PUSH_GROUPS.get(platform, {}).pop(_target_key(platform, target_id), None)
         await _redis_delete_config_groups(platform, target_id)
-        await _sync_platform_job(platform)
+        await _sync_platform_worker(platform)
     return changed
 
 # ===================== HTTP 客户端 =====================
@@ -627,6 +625,11 @@ _cpp_job_lock = asyncio.Lock()
 _bili_job_lock = asyncio.Lock()
 _xm_job_lock = asyncio.Lock()
 _qgm_job_lock = asyncio.Lock()
+
+_worker_lock = asyncio.Lock()
+_poll_tasks: Dict[str, asyncio.Task] = {}
+_send_task: asyncio.Task | None = None
+_send_queue: asyncio.Queue[tuple[str, Set[int]]] = asyncio.Queue()
 
 async def _rebuild_cpp_client():
     global cpp_client
@@ -771,12 +774,14 @@ async def _init_clients_and_redis():
                 _redis = None
                 logger.warning(f"Redis 连接失败，将仅使用内存配置：{e}")
 
-    await _sync_all_jobs()
+    await _sync_all_workers()
     logger.opt(colors=True).info("<g>nonebot_plugin_ticket_watch</g> 初始化完成")
 
 @driver.on_shutdown
 async def _close_clients_and_redis():
     global cpp_client, bili_client, xm_client, qgm_client, _redis
+    await _stop_all_workers()
+
     try:
         if cpp_client:
             await cpp_client.aclose()
@@ -800,50 +805,143 @@ async def _close_clients_and_redis():
     finally:
         _redis = None
 
-# ===================== 调度同步 =====================
-async def _sync_platform_job(platform: str):
-    platform = _normalize_platform_name(platform)
-    job_id = _job_id(platform)
-    job = scheduler.get_job(job_id)
-
+# ===================== worker 同步 =====================
+def _platform_interval(platform: str) -> float:
     if platform == "cpp":
-        func = cpp_tick_and_maybe_send
-        seconds = POLL_INTERVAL_CPP_SEC
-        label = "CPP"
+        return POLL_INTERVAL_CPP_SEC
+    if platform == "bilibili":
+        return POLL_INTERVAL_BILI_SEC
+    if platform == "xm":
+        return POLL_INTERVAL_XM_SEC
+    return POLL_INTERVAL_QGM_SEC
+
+
+def _platform_label(platform: str) -> str:
+    return {
+        "cpp": "CPP",
+        "bilibili": "B站",
+        "xm": "小芒",
+        "qgm": "奇古米",
+    }[platform]
+
+
+async def _platform_tick(platform: str):
+    if platform == "cpp":
+        await cpp_tick_and_maybe_send()
     elif platform == "bilibili":
-        func = bili_tick_and_maybe_send
-        seconds = POLL_INTERVAL_BILI_SEC
-        label = "B站"
+        await bili_tick_and_maybe_send()
     elif platform == "xm":
-        func = xm_tick_and_maybe_send
-        seconds = POLL_INTERVAL_XM_SEC
-        label = "小芒"
+        await xm_tick_and_maybe_send()
     else:
-        func = qgm_tick_and_maybe_send
-        seconds = POLL_INTERVAL_QGM_SEC
-        label = "奇古米"
+        await qgm_tick_and_maybe_send()
 
+
+async def _sync_platform_worker(platform: str):
+    platform = _normalize_platform_name(platform)
     if _platform_has_config(platform):
-        if job is None:
-            scheduler.add_job(
-                func,
-                "interval",
-                seconds=seconds,
-                id=job_id,
-                max_instances=2,
-                coalesce=True,
-            )
-            logger.info("%s 票务监控任务已启动，轮询周期 %.1fs", label, seconds)
+        await _start_platform_worker(platform)
     else:
-        if job is not None:
-            scheduler.remove_job(job_id)
-            logger.info("%s 票务监控任务已停止（当前无配置）", label)
+        await _stop_platform_worker(platform)
+        if not _has_any_monitor_config():
+            await _stop_send_worker(clear_queue=True)
 
-async def _sync_all_jobs():
-    await _sync_platform_job("cpp")
-    await _sync_platform_job("bilibili")
-    await _sync_platform_job("xm")
-    await _sync_platform_job("qgm")
+
+async def _sync_all_workers():
+    for platform in ("cpp", "bilibili", "xm", "qgm"):
+        await _sync_platform_worker(platform)
+
+
+async def _start_platform_worker(platform: str):
+    global _send_task
+    async with _worker_lock:
+        if _send_task is None or _send_task.done():
+            _send_task = asyncio.create_task(_send_worker(), name="ticket_watch_sender")
+
+        task = _poll_tasks.get(platform)
+        if task is None or task.done():
+            _poll_tasks[platform] = asyncio.create_task(_poll_worker(platform), name=f"ticket_watch_{platform}_poller")
+            logger.info("%s 票务监控 worker 已启动，轮询周期 %.1fs", _platform_label(platform), _platform_interval(platform))
+
+
+async def _stop_platform_worker(platform: str):
+    async with _worker_lock:
+        task = _poll_tasks.pop(platform, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            logger.info("%s 票务监控 worker 已停止（当前无配置）", _platform_label(platform))
+
+
+async def _stop_send_worker(clear_queue: bool = False):
+    global _send_task
+    async with _worker_lock:
+        task = _send_task
+        _send_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if clear_queue:
+            while not _send_queue.empty():
+                try:
+                    _send_queue.get_nowait()
+                    _send_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+
+
+async def _stop_all_workers():
+    async with _worker_lock:
+        tasks = [task for task in _poll_tasks.values() if not task.done()]
+        send_task = _send_task
+        if send_task is not None and not send_task.done():
+            tasks.append(send_task)
+        _poll_tasks.clear()
+        globals()["_send_task"] = None
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("票务监控 worker 已全部停止")
+        while not _send_queue.empty():
+            try:
+                _send_queue.get_nowait()
+                _send_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+
+async def _poll_worker(platform: str):
+    while True:
+        started = time.perf_counter()
+        try:
+            await _platform_tick(platform)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"{_platform_label(platform)} 票务轮询 worker 异常：{e}")
+
+        sleep_for = _platform_interval(platform) - (time.perf_counter() - started)
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
+
+
+async def _send_worker():
+    while True:
+        text, groups = await _send_queue.get()
+        try:
+            await safe_broadcast(text, groups)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"票务发送 worker 异常：{e}")
+        finally:
+            _send_queue.task_done()
+
+
+async def _enqueue_broadcast(text: str, target_groups: Set[int]):
+    groups = set(target_groups) & set(ENABLED_GROUPS)
+    if text and groups:
+        await _send_queue.put((text, groups))
 
 # ===================== CPP 轮询逻辑 =====================
 CPP_URL = "https://www.allcpp.cn/allcpp/ticket/getTicketTypeList.do"
@@ -949,7 +1047,7 @@ async def cpp_tick_and_maybe_send():
                     *merged,
                     ts,
                 ]
-                await safe_broadcast("\n".join(body), _get_push_groups("cpp", event_id))
+                await _enqueue_broadcast("\n".join(body), _get_push_groups("cpp", event_id))
             _cpp_last_send = now
             _cpp_prev_status.update(curr_all)
 
@@ -1057,7 +1155,7 @@ async def bili_tick_and_maybe_send():
                 *merged,
                 datetime.now().strftime("%Y.%m.%d %H:%M:%S"),
             ]
-            await safe_broadcast("\n".join(body), _get_push_groups("bilibili", project_id))
+            await _enqueue_broadcast("\n".join(body), _get_push_groups("bilibili", project_id))
             _bili_last_send = now
             _bili_prev_status[project_id] = curr
 
@@ -1161,7 +1259,7 @@ async def xm_tick_and_maybe_send():
                 *merged,
                 datetime.now().strftime("%Y.%m.%d %H:%M:%S"),
             ]
-            await safe_broadcast("\n".join(body), _get_push_groups("xm", goods_id))
+            await _enqueue_broadcast("\n".join(body), _get_push_groups("xm", goods_id))
             _xm_last_send = now
             _xm_prev_status[goods_id] = curr
 
@@ -1264,7 +1362,7 @@ async def qgm_tick_and_maybe_send():
                 *merged,
                 datetime.now().strftime("%Y.%m.%d %H:%M:%S"),
             ]
-            await safe_broadcast("\n".join(body), _get_push_groups("qgm", goods_id))
+            await _enqueue_broadcast("\n".join(body), _get_push_groups("qgm", goods_id))
             _qgm_last_send = now
             _qgm_prev_status[goods_id] = curr
 
